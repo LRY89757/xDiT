@@ -14,7 +14,7 @@ from xfuser.core.distributed import (
 )
 from torch.profiler import profile, record_function, ProfilerActivity
 
-def single_run(pipe, input_config, local_rank, batch_size):
+def single_run(pipe, input_config, local_rank, batch_size, use_flops_profile=False):
 
     output = pipe(
         height=input_config.height,
@@ -25,6 +25,7 @@ def single_run(pipe, input_config, local_rank, batch_size):
         max_sequence_length=256,
         guidance_scale=0.0,
         generator=torch.Generator(device="cuda").manual_seed(input_config.seed),
+        profile=use_flops_profile,
     )
     return output
 
@@ -34,7 +35,10 @@ def warmup(pipe, input_config, local_rank, batch_size, times=3):
 
 def main():
     parser = FlexibleArgumentParser(description="xFuser Arguments")
-    parser.add_argument('--batch_size', type=int, default=1, help='Batch size for inference')  # Added argument
+    parser.add_argument('--batch_size', type=int, default=1, help='Batch size for inference')
+    parser.add_argument('--use_profiler', action='store_true', default=True, help='Enable profiling (default: True)')
+    parser.add_argument('--no_profiler', action='store_false', dest='use_profiler', help='Disable profiling')
+    parser.add_argument('--use_flops_profile', action='store_true', help='profile flops')
     args = xFuserArgs.add_cli_args(parser).parse_args()
     engine_args = xFuserArgs.from_cli_args(args)
     engine_config, input_config = engine_args.create_config()
@@ -56,25 +60,30 @@ def main():
     prompt = [""] * args.batch_size
     input_config.prompt = prompt
 
-    pipe.prepare_run(input_config)
+    # like warmup actually if we don't use pipefusion
+    # pipe.prepare_run(input_config)
 
     # Warmup
     warmup(pipe, input_config, local_rank, args.batch_size, times=5 if args.batch_size == 1 and args.height == 1024 and args.width == 1024 else 1)
 
-    # Profiling
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                 profile_memory=True,
-                 with_stack=True,
-                 with_flops=True,
-                 with_modules=True,
-                 record_shapes=True,
-                #  on_trace_ready=torch.profiler.tensorboard_trace_handler("./tensorboard/xfuser_flux")
-                 ) as prof:
-        with record_function("xfuser_flux_pipeline"):
-            torch.cuda.reset_peak_memory_stats()
-            start_time = time.time()
-            output = single_run(pipe, input_config, local_rank, args.batch_size)
-            end_time = time.time()
+    # Modify the profiling section to use the new argument
+    if args.use_profiler:
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                     profile_memory=True,
+                     with_stack=True,
+                     with_flops=True,
+                     with_modules=True,
+                     record_shapes=True) as prof:
+            with record_function("xfuser_flux_pipeline"):
+                torch.cuda.reset_peak_memory_stats()
+                start_time = time.time()
+                output = single_run(pipe, input_config, local_rank, args.batch_size)
+                end_time = time.time()
+    else:
+        torch.cuda.reset_peak_memory_stats()
+        start_time = time.time()
+        output = single_run(pipe, input_config, local_rank, args.batch_size, args.use_flops_profile)
+        end_time = time.time()
 
     elapsed_time = end_time - start_time
     peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
@@ -82,19 +91,20 @@ def main():
     logging.info(f"Execution time: {elapsed_time:.2f} seconds")
     logging.info(f"Peak memory usage: {peak_memory / 1024**2:.2f} MB")
 
-    folder = f"flux/profile_data/ulysses_{engine_config.parallel_config.ulysses_degree}_"
-    folder += f"ring_{engine_config.parallel_config.ring_degree}/"
-    os.makedirs(folder, exist_ok=True)
+    if args.use_profiler:
+        folder = f"flux/profile_data/ulysses_{engine_config.parallel_config.ulysses_degree}_"
+        folder += f"ring_{engine_config.parallel_config.ring_degree}/"
+        os.makedirs(folder, exist_ok=True)
 
-    # Export Chrome trace
-    if local_rank == 0:
-        prof.export_chrome_trace(
-            folder + f"xfuser_flux_trace_steps_{input_config.num_inference_steps}_rank_{local_rank}_bs{args.batch_size}_size{input_config.height}.json"
-        )
+        # Export Chrome trace
+        if local_rank == 0:
+            prof.export_chrome_trace(
+                folder + f"xfuser_flux_trace_steps_{input_config.num_inference_steps}_rank_{local_rank}_bs{args.batch_size}_size{input_config.height}.json"
+            )
 
-    # Print key averages
-    if local_rank == 0:
-        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+        # Print key averages
+        if local_rank == 0:
+            print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 
     get_runtime_state().destory_distributed_env()
 

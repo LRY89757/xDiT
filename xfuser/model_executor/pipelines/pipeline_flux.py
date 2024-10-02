@@ -73,6 +73,7 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
             num_inference_steps=steps,
             output_type="latent",
             max_sequence_length=input_config.max_sequence_length,
+            # generator=torch.Generator(device="cuda").manual_seed(42),
             generator=torch.Generator(device="cuda").manual_seed(42),
         )
         get_runtime_state().runtime_config.warmup_steps = warmup_steps
@@ -307,6 +308,7 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
                     callback_on_step_end=callback_on_step_end,
                     callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
                     sync_only=True,
+                    **kwargs,
                 )
 
         if is_dp_last_group():
@@ -366,6 +368,7 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         sync_only: bool = False,
+        **kwargs,
     ):
         latents, latent_image_ids = self._init_sync_pipeline(latents, latent_image_ids)
         for i, t in enumerate(timesteps):
@@ -400,6 +403,7 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
                 latent_image_ids=latent_image_ids,
                 guidance=guidance,
                 t=t,
+                profile=(kwargs.get("profile", False) if i == len(timesteps) - 1 else False),
             )
 
             if is_pipeline_last_stage():
@@ -465,21 +469,53 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
         latent_image_ids,
         guidance,
         t: Union[float, torch.Tensor],
+        **kwargs,
     ):
         # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
         timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
-        noise_pred = self.transformer(
-            hidden_states=latents,
-            timestep=timestep / 1000,
-            guidance=guidance,
-            pooled_projections=pooled_prompt_embeds,
-            encoder_hidden_states=encoder_hidden_states,
-            txt_ids=text_ids,
-            img_ids=latent_image_ids,
-            joint_attention_kwargs=self.joint_attention_kwargs,
-            return_dict=False,
-        )[0]
+        if kwargs.get("profile", False):
+            from .flops_profiler import get_model_profile
+            flops, macs, params = get_model_profile(
+                self.transformer,
+                kwargs={
+                    "hidden_states": latents,
+                "timestep": timestep / 1000,
+                "guidance": guidance,
+                    "pooled_projections": pooled_prompt_embeds,
+                    "encoder_hidden_states": encoder_hidden_states,
+                    "txt_ids": text_ids,
+                    "img_ids": latent_image_ids,
+                    "joint_attention_kwargs": self.joint_attention_kwargs,
+                    "return_dict": False,
+                },
+                print_profile=True,
+                detailed=True,
+            )
+            print(f"FLOPs: {flops}, MACs: {macs}, Params: {params}")
+            noise_pred = self.transformer(
+                hidden_states=latents,
+                timestep=timestep / 1000,
+                guidance=guidance,
+                pooled_projections=pooled_prompt_embeds,
+                encoder_hidden_states=encoder_hidden_states,
+                txt_ids=text_ids,
+                img_ids=latent_image_ids,
+                joint_attention_kwargs=self.joint_attention_kwargs,
+                return_dict=False,
+            )[0]
+        else:
+            noise_pred = self.transformer(
+                hidden_states=latents,
+                timestep=timestep / 1000,
+                guidance=guidance,
+                pooled_projections=pooled_prompt_embeds,
+                encoder_hidden_states=encoder_hidden_states,
+                txt_ids=text_ids,
+                img_ids=latent_image_ids,
+                joint_attention_kwargs=self.joint_attention_kwargs,
+                return_dict=False,
+            )[0]
 
         return noise_pred
 
