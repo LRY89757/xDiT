@@ -10,10 +10,10 @@ pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-dev", torch_dtype=
 # pipe.enable_model_cpu_offload() #save some VRAM by offloading the model to CPU. Remove this if you have enough GPU power
 
 
-def single_run(height=1024, width=1024, num_inference_steps=50):
+def single_run(batch_size=1, height=1024, width=1024, num_inference_steps=50):
     prompt = "A cat holding a sign that says hello world"
     image = pipe(
-        prompt,
+        prompt=[prompt] * batch_size,
         height=height,
         width=width,
         guidance_scale=3.5,
@@ -57,7 +57,7 @@ def stop_record_memory_history() -> None:
     logger.info("Stopping snapshot record_memory_history")
     torch.cuda.memory._record_memory_history(enabled=None)
 
-def export_memory_snapshot() -> None:
+def export_memory_snapshot(file_prefix: str = "") -> None:
     if not torch.cuda.is_available():
         logger.info("CUDA unavailable. Not exporting memory snapshot")
         return
@@ -65,7 +65,7 @@ def export_memory_snapshot() -> None:
     # Prefix for file names.
     host_name = socket.gethostname()
     timestamp = datetime.now().strftime(TIME_FORMAT_STR)
-    file_prefix = f"{host_name}_{timestamp}"
+    file_prefix = f"{file_prefix}_{host_name}_{timestamp}"
 
     try:
         logger.info(f"Saving snapshot to local file: {file_prefix}.pickle")
@@ -74,15 +74,15 @@ def export_memory_snapshot() -> None:
         logger.error(f"Failed to capture memory snapshot {e}")
         return
 
-def run_flux_with_memory_profiling(num_inference_steps=10):
+def run_flux_with_memory_profiling(batch_size=1, height=1024, width=1024, num_inference_steps=5):
     # Start recording memory snapshot history
     start_record_memory_history()
 
     # Run Flux
-    single_run(num_inference_steps=num_inference_steps)
+    single_run(batch_size=batch_size, height=height, width=width, num_inference_steps=num_inference_steps)
 
     # Create the memory snapshot file
-    export_memory_snapshot()
+    export_memory_snapshot(f"bs{batch_size}-h{height}-w{width}")
 
     # Stop recording memory snapshot history
     stop_record_memory_history()
@@ -95,4 +95,4 @@ def warmup(times=3):
 if __name__ == "__main__":
     warmup(5)
     # Run Flux with memory profiling
-    run_flux_with_memory_profiling(5)
+    run_flux_with_memory_profiling(batch_size=4, height=2048, width=2048, num_inference_steps=5)
